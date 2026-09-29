@@ -146,6 +146,7 @@ import cron from 'node-cron';
 import { release } from 'os';
 import { join } from 'path';
 import P from 'pino';
+import * as zlib from 'zlib';
 import qrcode, { QRCodeToDataURLOptions } from 'qrcode';
 import qrcodeTerminal from 'qrcode-terminal';
 import sharp from 'sharp';
@@ -281,11 +282,61 @@ export class BaileysStartupService extends ChannelStartupService {
     const rec = sa?.value?.callLogAction?.callLogRecord;
     if (!rec) return;
     const index: string[] = Array.isArray(j?.syncAction?.index) ? j.syncAction.index : [];
+    this.aramaKaydiGonder(rec, index);
+  }
+  // KURTARMA ANLIK GÖRÜNTÜSÜ (Cravio): oturumun uygulama-durumu anahtarları eksik/bozuksa (bad decrypt) telefondan
+  // COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY istenir; telefon 'regular' koleksiyonunun ŞİFRESİZ kopyasını
+  // (SyncdSnapshotRecovery) peer mesajıyla gönderir → arama kayıtları anahtar gerekmeden okunur. Her server_sync'te
+  // (en çok dakikada bir) yenilenir; yalnızca son 3 saatin kayıtları iletilir (eski aramalar ekibe yeniden düşmesin).
+  private aramaKurtarmaSon = 0;
+  private aramaKurtarmaIste(neden: string) {
+    if (process.env.ARAMA_KURTARMA === 'false') return;
+    const simdi = Date.now();
+    if (simdi - this.aramaKurtarmaSon < 60000) return;
+    this.aramaKurtarmaSon = simdi;
+    const pdo: any = {
+      peerDataOperationRequestType: (proto.Message.PeerDataOperationRequestType as any).COMPANION_SYNCD_SNAPSHOT_FATAL_RECOVERY ?? 8,
+      syncdCollectionFatalRecoveryRequest: { collectionName: 'regular', timestamp: Math.floor(simdi / 1000) },
+    };
+    Promise.resolve()
+      .then(() => (this.client as any)?.sendPeerDataOperationMessage?.(pdo))
+      .then((id: any) => this.logger.warn(`[arama-kaydi] kurtarma anlık görüntüsü istendi (${neden}) id=${id ?? '?'}`))
+      .catch((e: any) => this.logger.warn(`[arama-kaydi] kurtarma isteği hatası: ${e?.message}`));
+  }
+  private aramaKurtarmaYaniti(m: any) {
+    const sonuclar: any[] = m?.message?.protocolMessage?.peerDataOperationRequestResponseMessage?.peerDataOperationResult || [];
+    for (const r of sonuclar) {
+      const yanit = r?.syncdSnapshotFatalRecoveryResponse;
+      if (!yanit?.collectionSnapshot) continue;
+      try {
+        let veri = Buffer.from(yanit.collectionSnapshot);
+        if (yanit.isCompressed) veri = zlib.gunzipSync(veri);
+        const kayit: any = (proto as any).SyncdSnapshotRecovery.decode(veri);
+        const esik = Date.now() / 1000 - 3 * 3600;
+        let toplam = 0, arama = 0, yeni = 0;
+        for (const mr of kayit.mutationRecords || []) {
+          toplam++;
+          const v = mr?.value;
+          const cl = v?.value?.callLogAction?.callLogRecord;
+          if (!cl) continue;
+          arama++;
+          if (Number(cl.startTime) && Number(cl.startTime) < esik) continue;
+          let index: string[] = [];
+          try { index = JSON.parse(Buffer.from(v.index || []).toString()); } catch { /* index yoksa */ }
+          if (this.aramaKaydiGonder(cl, index)) yeni++;
+        }
+        this.logger.warn(`[arama-kaydi] kurtarma yanıtı: ${kayit.collectionName} v${kayit.version?.version ?? '?'} — ${toplam} kayıt, ${arama} arama, ${yeni} yeni iletildi`);
+      } catch (e: any) {
+        this.logger.warn(`[arama-kaydi] kurtarma yanıtı çözülemedi: ${e?.message}`);
+      }
+    }
+  }
+  private aramaKaydiGonder(rec: any, index: string[]): boolean {
     const callId = String(rec.callId || index[2] || '');
     const sonuc = String(rec.callResult || '');
-    if (!callId || sonuc === 'ONGOING' || sonuc === 'UPCOMING') return;
+    if (!callId || sonuc === 'ONGOING' || sonuc === 'UPCOMING') return false;
     const anahtar = callId + '|' + sonuc;
-    if (this.aramaGorulen.has(anahtar)) return;
+    if (this.aramaGorulen.has(anahtar)) return false;
     this.aramaGorulen.add(anahtar);
     if (this.aramaGorulen.size > 1000) this.aramaGorulen.delete(this.aramaGorulen.values().next().value);
     const benim = new Set([this.instance.wuid, this.client?.user?.id, this.client?.user?.lid].filter(Boolean).map((x) => String(x).split(':')[0].split('@')[0]));
@@ -315,6 +366,7 @@ export class BaileysStartupService extends ChannelStartupService {
         .then((pn: any) => gonder(pn ? String(pn) : undefined))
         .catch(() => gonder());
     } else gonder(kisi);
+    return true;
   }
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
@@ -771,10 +823,12 @@ export class BaileysStartupService extends ChannelStartupService {
       let aramaSurumKuruldu = false;
       (this.client as any).ws?.on?.('frame', (node: any) => {
         try {
-          if (aramaSurumKuruldu || node?.tag !== 'notification' || node?.attrs?.type !== 'server_sync') return;
+          if (node?.tag !== 'notification' || node?.attrs?.type !== 'server_sync') return;
           const col = (Array.isArray(node.content) ? node.content : []).find((c: any) => c?.tag === 'collection' && c?.attrs?.name === 'regular');
           const v = Number(col?.attrs?.version);
-          if (!v || process.env.ARAMA_KAYDI_ARTIMLI === 'false') return;
+          if (!v) return;
+          setTimeout(() => this.aramaKurtarmaIste('server_sync v' + v), 1500);
+          if (aramaSurumKuruldu || process.env.ARAMA_KAYDI_ARTIMLI === 'false') return;
           aramaSurumKuruldu = true;
           this.logger.warn(`[arama-kaydi] regular koleksiyonu artımlı senkrona alındı: yerel sürüm ${v - 1} (sunucu ${v})`);
           void socketConfig.auth.keys.set({ 'app-state-sync-version': { regular: { version: v - 1, hash: Buffer.alloc(128), indexValueMap: {} } as any } });
@@ -784,6 +838,12 @@ export class BaileysStartupService extends ChannelStartupService {
       });
     } catch {
       /* ws yoksa */
+    }
+    try {
+      this.client.ev.on('messages.upsert', ({ messages }: any) => { for (const m of messages || []) { try { this.aramaKurtarmaYaniti(m); } catch { /* yoksay */ } } });
+      this.client.ev.on('connection.update', (u: any) => { if (u?.connection === 'open') setTimeout(() => this.aramaKurtarmaIste('bağlantı açıldı'), 20000); });
+    } catch {
+      /* ev yoksa */
     }
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
