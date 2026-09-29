@@ -763,6 +763,29 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.client = makeWASocket(socketConfig);
 
+    // ARAMA KAYDI (Cravio): 'regular' koleksiyonunun sürüm-0 anlık görüntüsü eski/bozuk bir anahtar yüzünden çözülemiyorsa
+    // (bad decrypt → Baileys her seferinde sıfırdan dener ve hep düşer) yerel sürüm, sunucunun bildirdiği sürümün bir gerisine
+    // kurulur: yalnızca YENİ değişiklikler (yeni aramalar) güncel anahtarla çekilir. Frame olayı Baileys'in kendi
+    // işleyicisinden önce gelir; önbellekli anahtar deposu set'i eşzamanlı işler → yarış yok.
+    try {
+      let aramaSurumKuruldu = false;
+      (this.client as any).ws?.on?.('frame', (node: any) => {
+        try {
+          if (aramaSurumKuruldu || node?.tag !== 'notification' || node?.attrs?.type !== 'server_sync') return;
+          const col = (Array.isArray(node.content) ? node.content : []).find((c: any) => c?.tag === 'collection' && c?.attrs?.name === 'regular');
+          const v = Number(col?.attrs?.version);
+          if (!v || process.env.ARAMA_KAYDI_ARTIMLI === 'false') return;
+          aramaSurumKuruldu = true;
+          this.logger.warn(`[arama-kaydi] regular koleksiyonu artımlı senkrona alındı: yerel sürüm ${v - 1} (sunucu ${v})`);
+          void socketConfig.auth.keys.set({ 'app-state-sync-version': { regular: { version: v - 1, hash: Buffer.alloc(128), indexValueMap: {} } as any } });
+        } catch {
+          /* yoksay */
+        }
+      });
+    } catch {
+      /* ws yoksa */
+    }
+
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
