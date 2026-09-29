@@ -250,6 +250,72 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+
+  // ---- ARAMA KAYDI (Cravio, 29 Eyl 2026) ----
+  // WhatsApp, telefondan yapılan/alınan her aramayı bağlı cihazlara "uygulama durumu" kaydı olarak gönderir
+  // (SyncActionValue.callLogAction → CallLogRecord: sonuç CONNECTED/MISSED/CANCELLED/…, süre, saat, gelen/giden, kişi).
+  // Baileys bu kaydı işlemez; yalnızca 'trace' seviyesinde "processing sync action" iziyle loglar. Burada o iz yakalanır ve
+  // mevcut CALL webhook olayı olarak gönderilir (data.source = 'call_log'). Normal Baileys logu LOG_BAILEYS seviyesinde kalır.
+  private aramaGorulen = new Set<string>();
+  private aramaKaydiLogger() {
+    const esik = (P.levels.values as Record<string, number>)[this.logBaileys] ?? 50;
+    const self = this;
+    return P(
+      { level: 'trace' },
+      {
+        write(line: string) {
+          try {
+            if (line.includes('callLogAction')) self.aramaKaydiYakala(line);
+            const lv = Number((line.match(/"level":(\d+)/) || [])[1]);
+            if (lv >= esik) process.stdout.write(line);
+          } catch {
+            /* log satırı bozuksa atla */
+          }
+        },
+      },
+    );
+  }
+  private aramaKaydiYakala(line: string) {
+    const j = JSON.parse(line);
+    const sa = j?.syncAction?.syncAction ?? j?.syncAction;
+    const rec = sa?.value?.callLogAction?.callLogRecord;
+    if (!rec) return;
+    const index: string[] = Array.isArray(j?.syncAction?.index) ? j.syncAction.index : [];
+    const callId = String(rec.callId || index[2] || '');
+    const sonuc = String(rec.callResult || '');
+    if (!callId || sonuc === 'ONGOING' || sonuc === 'UPCOMING') return;
+    const anahtar = callId + '|' + sonuc;
+    if (this.aramaGorulen.has(anahtar)) return;
+    this.aramaGorulen.add(anahtar);
+    if (this.aramaGorulen.size > 1000) this.aramaGorulen.delete(this.aramaGorulen.values().next().value);
+    const benim = new Set([this.instance.wuid, this.client?.user?.id, this.client?.user?.lid].filter(Boolean).map((x) => String(x).split(':')[0].split('@')[0]));
+    const kisi = (rec.participants || []).map((p: any) => String(p.userJid || '')).find((u: string) => u && !benim.has(u.split('@')[0]))
+      || (rec.isIncoming ? String(rec.callCreatorJid || '') : String(index[1] || ''));
+    const gonder = (senderPn?: string) =>
+      this.sendDataWebhook(Events.CALL, {
+        source: 'call_log',
+        id: callId,
+        callId,
+        from: kisi,
+        remoteJid: kisi,
+        senderPn: senderPn || undefined,
+        status: sonuc,
+        callResult: sonuc,
+        isIncoming: !!rec.isIncoming,
+        isVideo: !!rec.isVideo,
+        duration: Number(rec.duration) || 0,
+        startTime: Number(rec.startTime) || null,
+        callCreatorJid: rec.callCreatorJid || null,
+        participants: rec.participants || [],
+        date_time: new Date().toISOString(),
+      });
+    if (kisi.endsWith('@lid')) {
+      Promise.resolve()
+        .then(() => (this.client as any)?.signalRepository?.lidMapping?.getPNForLID?.(kisi))
+        .then((pn: any) => gonder(pn ? String(pn) : undefined))
+        .catch(() => gonder());
+    } else gonder(kisi);
+  }
   private eventProcessingQueue: Promise<void> = Promise.resolve();
 
   // Cache TTL constants (in seconds)
@@ -638,7 +704,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
-      logger: P({ level: this.logBaileys }),
+      logger: this.aramaKaydiLogger(),
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
